@@ -1,0 +1,8 @@
+[package]
+name = "obozrenie-core"
+version = "0.1.0"
+authors = ["Artem Vorotnikov <artem@vorotnikov.me>"]
+description = "Obozrenie Game Server Browser. Core library."
+repository = "https://github.com/obozrenie/obozrenie-core"
+keywords = ["game", "games", "browser"]
+license = "GPL-3.0"
