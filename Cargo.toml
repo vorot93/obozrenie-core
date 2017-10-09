@@ -8,10 +8,10 @@ keywords = ["game", "games", "browser"]
 license = "GPL-3.0"
 
 [dependencies]
-geoip = "0.0.11"
-custom_derive = "0.1"
-newtype_derive = "0.1"
-serde = "0.8"
-serde_derive = "0.8"
-serde_json = "0.8"
-rgs_models = "0.2"
+geoip = "*"
+custom_derive = "*"
+newtype_derive = "*"
+serde = "*"
+serde_derive = "*"
+serde_json = "*"
+rgs_models = "*"

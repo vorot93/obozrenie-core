@@ -42,7 +42,7 @@ impl From<serde_json::Error> for Error {
 }
 
 custom_derive!{
-    #[derive(NewtypeDeref, NewtypeDerefMut, Clone, Debug, Default)]
+    #[derive(NewtypeDeref, NewtypeDerefMut, Clone, Debug)]
     pub struct ServerEntry(Server);
 }
 
@@ -62,7 +62,7 @@ impl PartialOrd for ServerEntry {
 
 impl Ord for ServerEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.host.cmp(&other.host)
+        self.addr.cmp(&other.addr)
     }
 }
 
