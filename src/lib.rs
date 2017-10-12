@@ -1,9 +1,13 @@
+#![recursion_limit="1024"]
+
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
 extern crate custom_derive;
 #[macro_use]
 extern crate newtype_derive;
+#[macro_use]
+extern crate error_chain;
 
 extern crate serde;
 extern crate serde_json;
@@ -22,6 +26,7 @@ extern crate rgs_models;
 //                     - Setting C
 
 mod backends;
+mod errors;
 mod launch;
 mod models;
 
@@ -94,12 +99,22 @@ impl ConfType {
 
 pub type Settings = HashMap<ConfType, ConfStorage>;
 
-#[derive(Default)]
 pub struct GameEntry {
     pub status: QueryStatus,
-    pub query_func: QueryFunc,
+    pub data_source: Box<models::DataSource>,
     pub servers: ServerData,
     pub settings: Settings,
+}
+
+impl Default for GameEntry {
+    fn default() -> Self {
+        Self {
+            status: Default::default(),
+            data_source: Box::new(MockDataSource),
+            servers: Default::default(),
+            settings: Default::default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -107,9 +122,15 @@ pub struct GameTable {
     data: Mutex<HashMap<GameID, GameEntry>>,
 }
 
-fn get_game_entry<'a>(obj: &'a mut HashMap<GameID, GameEntry>, id: &GameID) -> Result<&'a mut GameEntry, Error> {
+fn get_game_entry<'a>(
+    obj: &'a mut HashMap<GameID, GameEntry>,
+    id: &GameID,
+) -> errors::Result<&'a mut GameEntry> {
     let id = id.clone();
-    obj.get_mut(&id).ok_or(Error::NoSuchGameError(id))
+    obj.get_mut(&id).ok_or(
+        errors::ErrorKind::NoSuchGameError(id)
+            .into(),
+    )
 }
 
 impl GameTable {
@@ -118,14 +139,16 @@ impl GameTable {
     }
 
     fn exec<T, R>(&self, mut func: T) -> R
-        where T: FnMut(&HashMap<GameID, GameEntry>) -> R
+    where
+        T: FnMut(&HashMap<GameID, GameEntry>) -> R,
     {
         let obj = self.data.lock().unwrap();
         func(&*obj)
     }
 
     fn exec_mut<T, R>(&mut self, mut func: T) -> R
-        where T: FnMut(&mut HashMap<GameID, GameEntry>) -> R
+    where
+        T: FnMut(&mut HashMap<GameID, GameEntry>) -> R,
     {
         let mut obj = self.data.lock().unwrap();
         func(&mut *obj)
@@ -133,29 +156,35 @@ impl GameTable {
 
     pub fn list_games(&self) -> BTreeSet<GameID> {
         self.exec(|data| {
-            data.iter().fold(BTreeSet::<GameID>::new(), |mut acc, entry| { acc.insert(entry.0.clone()); acc })
+            data.iter().fold(
+                BTreeSet::<GameID>::new(),
+                |mut acc, entry| {
+                    acc.insert(entry.0.clone());
+                    acc
+                },
+            )
         })
     }
 
-    pub fn create_game_entry(&mut self, id: &GameID) -> Result<(), Error> {
+    pub fn create_game_entry(&mut self, id: &GameID) -> errors::Result<()> {
         self.exec_mut(|mut data| {
             let id = id.clone();
             match data.entry(id.clone()) {
                 Vacant(entry) => entry.insert(GameEntry::default()),
                 Occupied(_) => {
-                    return Err(Error::GameExistsError(id));
+                    bail!(errors::ErrorKind::GameExistsError(id));
                 }
             };
             Ok(())
         })
     }
 
-    pub fn remove_game_entry(&mut self, id: &GameID) -> Result<(), Error> {
+    pub fn remove_game_entry(&mut self, id: &GameID) -> errors::Result<()> {
         self.exec_mut(|mut data| {
             let id = id.clone();
             match data.entry(id.clone()) {
                 Vacant(_) => {
-                    return Err(Error::NoSuchGameError(id));
+                    bail!(errors::ErrorKind::NoSuchGameError(id));
                 }
                 Occupied(entry) => {
                     entry.remove_entry();
@@ -164,8 +193,8 @@ impl GameTable {
             Ok(())
         })
     }
-    fn get_settings(&mut self, id: &GameID, t: ConfType) -> Result<ConfStorage, Error> {
-        self.exec_mut(|mut data| -> Result<ConfStorage, Error> {
+    fn get_settings(&mut self, id: &GameID, t: ConfType) -> Result<ConfStorage, errors::Error> {
+        self.exec_mut(|mut data| {
             let id = id.clone();
             let game_entry = try!(get_game_entry(&mut data, &id));
 

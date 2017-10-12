@@ -1,26 +1,33 @@
 extern crate core;
+extern crate futures;
+extern crate futures_spawn;
 extern crate std;
 extern crate serde_json;
+
+use errors;
+use models;
 
 use serde_json::Value;
 use std::collections::*;
 use std::process::*;
 use std::ops::Deref;
+use self::futures::*;
+use self::futures_spawn::*;
 
 use models::*;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct QStatPlayer {
     name: String,
-    score: Option<String>,
+    score: Option<i64>,
     ping: Option<i64>,
     time: Option<String>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct QStatServer {
     protocol: Option<String>,
-    address: Option<String>,
+    address: std::net::SocketAddr,
     status: Option<String>,
     hostname: Option<String>,
     name: Option<String>,
@@ -35,6 +42,14 @@ struct QStatServer {
     players: Vec<QStatPlayer>,
 }
 
+impl QStatServer {
+    fn try_into(&self) -> errors::Result<ServerEntry> {
+        let v = models::ServerEntry::new(self.address);
+
+        Ok(v)
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct QStatResponse(Vec<QStatServer>);
 
@@ -45,14 +60,19 @@ impl Deref for QStatResponse {
     }
 }
 
+pub struct Backend;
+
 fn make_rulestring(rules: &HashMap<String, String>) -> String {
-    rules.iter().fold(String::new(), |acc, kv| acc + "," + kv.0 + "=" + kv.1)
+    rules.iter().fold(String::new(), |acc, kv| {
+        acc + "," + kv.0 + "=" + kv.1
+    })
 }
 
-fn make_qstat_cmd_params(master_type: &str,
-                         rules: &HashMap<String, String>,
-                         master_server_uri: &Vec<String>)
-                         -> Vec<String> {
+fn make_qstat_cmd_params(
+    master_type: &str,
+    rules: &HashMap<String, String>,
+    master_server_uri: &Vec<String>,
+) -> Vec<String> {
     let rulestring = make_rulestring(rules);
 
     let mut cmd: Vec<String> = vec![];
@@ -68,74 +88,116 @@ fn make_qstat_cmd_params(master_type: &str,
     cmd
 }
 
-fn get_string_array(v: &Value) -> Result<Vec<String>, Error> {
-    let varray = try!(v.as_array()
-        .ok_or(Error::DataParseError("Not a valid array of strings".into())));
+fn get_string_array(v: &Value) -> errors::Result<Vec<String>> {
+    let varray = match *v {
+        Value::Array(ref e) => e,
+        _ => {
+            bail!(errors::ErrorKind::DataParseError(
+                "Not a valid array of strings".into(),
+            ))
+        }
+    };
     let mut out = Vec::<String>::new();
     for val in varray {
-        out.push(try!(v.as_str().ok_or(Error::DataParseError("Not a string".into()))).into());
+        match *val {
+            Value::String(ref s) => {
+                out.push(s.clone());
+            }
+            _ => {
+                bail!(errors::ErrorKind::DataParseError("Not a string".into()));
+            }
+        }
     }
 
     Ok(out)
 }
 
-fn parse_server_entry(entry: &QStatServer) -> Result<ServerEntry, Error> {
-    let mut v = ServerEntry::default();
-    v.host = try!(entry.address
-        .clone()
-        .ok_or(Error::NullException("Host address cannot be empty".into())));
-
-    Ok(v)
-}
-
-fn parse(raw: &str, server_type: &str) -> Result<ServerData, Error> {
+fn parse(raw: &str, server_type: &str) -> errors::Result<ServerData> {
     let data: QStatResponse = try!(serde_json::from_str(raw));
 
-    Ok(data.iter().fold(ServerData::default(), |mut acc, ref entry| {
-        match parse_server_entry(&entry) {
-            Ok(v) => {
-                acc.insert(v);
-            }
-            _ => {}
-        }
-        acc
-    }))
+    Ok(data.iter().fold(
+        ServerData::default(),
+        |mut acc, ref entry| {
+            entry.try_into().map(|v| { acc.insert(v); });
+            acc
+        },
+    ))
 }
 
-pub fn query(settings: &ConfStorage) -> Result<ServerData, Error> {
-    let qstat_path: String = try!(settings.get_or_err("qstat_path"));
-    let master_type: String = try!(settings.get_or_err("qstat_master_type"));
-    let server_type: String = try!(settings.get_or_err("qstat_server_type"));
-    let master_server_uri: Vec<String> = try!(settings.get_or_err("master_server_uri"));
+struct QuerySettings {
+    qstat_path: String,
+    master_type: String,
+    server_type: String,
+    master_server_uri: Vec<String>,
+    qstat_game_type: Option<String>,
+}
+
+impl QuerySettings {
+    fn try_from(v: &ConfStorage) -> errors::Result<QuerySettings> {
+        Ok(Self {
+            qstat_path: v.get_or_err("qstat_path")?,
+            master_type: v.get_or_err("qstat_master_type")?,
+            server_type: v.get_or_err("qstat_server_type")?,
+            master_server_uri: v.get_or_err("master_server_uri")?,
+            qstat_game_type: v.get("qstat_game_type".into())
+                .and_then(|j| match *j {
+                    Value::String(ref j) => j.into(),
+                    _ => None,
+                })
+                .cloned(),
+        })
+    }
+}
+
+fn query(settings: &QuerySettings) -> errors::Result<ServerData> {
 
     let mut rules = HashMap::<String, String>::new();
-    match settings.get("qstat_game_type".into()) {
-        Some(val) => {
-            match *val {
-                Value::String(ref v) => {
-                    rules.insert("qstat_game_type".into(), v.clone());
-                }
-                _ => {}
-            }
-        }
-        _ => {}
-    }
 
-    let mut child = try!(Command::new(qstat_path)
-        .arg(make_qstat_cmd_params(&master_type, &rules, &master_server_uri).join(" "))
+    settings.qstat_game_type.as_ref().map(|v| {
+        rules.insert("qstat_game_type".into(), v.clone());
+    });
+    let mut child = Command::new(&settings.qstat_path)
+        .arg(
+            make_qstat_cmd_params(&settings.master_type, &rules, &settings.master_server_uri)
+                .join(" "),
+        )
         .stdout(Stdio::piped())
-        .spawn());
+        .spawn()?;
 
-    let out = try!(child.wait_with_output());
+    let out = child.wait_with_output()?;
     if !out.status.success() {
-        return Err(Error::IOError(match out.status.code() {
-            Some(code) => format!("QStat exited with status: {}", code).into(),
+        let desc = match out.status.code() {
+            Some(code) => format!("QStat exited with status: {}", code),
             None => "QStat killed by a signal".into(),
-        }));
+        };
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, desc.as_str()).into(),
+        );
     }
 
-    parse(try!(String::from_utf8(out.stdout.clone())).as_str(),
-          &server_type)
+    parse(
+        &String::from_utf8(out.stdout.clone())?,
+        &settings.server_type,
+    )
+}
+
+impl Backend {
+    fn get_qstat_output(&self) {}
+}
+
+impl models::DataSource for Backend {
+    fn query(&self, settings: &ConfStorage) -> Box<errors::FResult<ServerData>> {
+        let s = match QuerySettings::try_from(settings) {
+            Ok(v) => v,
+            Err(e) => {
+                return Box::new(future::result(Err(e)));
+            }
+        };
+
+        Box::from(futures_spawn::NewThread.spawn(
+            futures::lazy(move || query(&s)),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -151,14 +213,16 @@ mod tests {
         let master_server_uri = vec!["serverA".into(), "serverB".into()];
 
         let func = &make_qstat_cmd_params;
-        let expectation: Vec<String> = vec![String::from("-json"),
-                                            String::from("-utf8"),
-                                            String::from("-maxsim"),
-                                            String::from("9999"),
-                                            String::from("-R"),
-                                            String::from("-P"),
-                                            String::from("-q3s") + &make_rulestring(&rules),
-                                            String::from("serverA serverB")];
+        let expectation: Vec<String> = vec![
+            String::from("-json"),
+            String::from("-utf8"),
+            String::from("-maxsim"),
+            String::from("9999"),
+            String::from("-R"),
+            String::from("-P"),
+            String::from("-q3s") + &make_rulestring(&rules),
+            String::from("serverA serverB"),
+        ];
         assert_eq!(func("q3s", &rules, &master_server_uri), expectation);
     }
 
@@ -168,9 +232,9 @@ mod tests {
 [
     {
         "protocol": "a2s",
-        "address": "123.456.789.0:33333",
+        "address": "100.110.120.130:33333",
         "status": "online",
-        "hostname": "123.456.789.0:33333",
+        "hostname": "100.110.120.130:33333",
         "name": "MyPreciousServer",
         "gametype": "cstrike",
         "map": "de_dust2",
@@ -209,7 +273,7 @@ mod tests {
 "##;
         let func = &parse;
         let mut expectation = ServerData::default();
-        expectation.insert(ServerEntry::default());
+        expectation.insert(ServerEntry::new("100.110.120.130:33333".parse().unwrap()));
         assert_eq!(func(fixture, "a2s").unwrap(), expectation);
     }
 }
